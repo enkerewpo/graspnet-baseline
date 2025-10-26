@@ -30,6 +30,8 @@ parser.add_argument('--num_point', type=int, default=20000, help='Point Number [
 parser.add_argument('--num_view', type=int, default=300, help='View Number [default: 300]')
 parser.add_argument('--collision_thresh', type=float, default=0.01, help='Collision Threshold in collision detection [default: 0.01]')
 parser.add_argument('--voxel_size', type=float, default=0.01, help='Voxel Size to process point clouds before collision detection [default: 0.01]')
+parser.add_argument('--headless', action='store_true', help='Run in headless mode (no interactive visualization)')
+parser.add_argument('--save_vis', type=str, default=None, help='Save visualization to image file instead of displaying')
 cfgs = parser.parse_args()
 
 
@@ -109,7 +111,27 @@ def vis_grasps(gg, cloud):
     gg.sort_by_score()
     gg = gg[:50]
     grippers = gg.to_open3d_geometry_list()
-    o3d.visualization.draw_geometries([cloud, *grippers])
+    
+    # Check for headless mode via environment variable or argument
+    headless = cfgs.headless or os.environ.get('OPEN3D_HEADLESS', '').lower() in ('1', 'true', 'yes')
+    
+    if headless or cfgs.save_vis:
+        print("[*] Running in headless mode - skipping interactive visualization")
+        print(f"[*] Generated {len(gg)} grasps (top 50 after NMS)")
+        if cfgs.save_vis:
+            print(f"[*] Saving visualization to {cfgs.save_vis}...")
+            vis = o3d.visualization.Visualizer()
+            vis.create_window(visible=False)
+            vis.add_geometry(cloud)
+            for gripper in grippers:
+                vis.add_geometry(gripper)
+            vis.poll_events()
+            vis.update_renderer()
+            vis.capture_screen_image(cfgs.save_vis)
+            vis.destroy_window()
+            print(f"[*] Visualization saved to {cfgs.save_vis}")
+    else:
+        o3d.visualization.draw_geometries([cloud, *grippers])
 
 def demo(data_dir):
     net = get_net()
