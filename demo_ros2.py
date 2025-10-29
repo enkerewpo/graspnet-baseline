@@ -230,10 +230,10 @@ class GraspNetRos2Node(Node):
                     # Publish GraspPose message
                     self.grasp_pub.publish(grasp_pose_msg)
                     
+                    inference_time = grasp_data.get('inference_time', 0.0)
                     self.get_logger().info(
-                        f'Published grasp - processing_time: {grasp_data["processing_time"]:.4f}s, '
-                        f'gripper_width: {gripper_width:.4f}m, '
-                        f'pose: [{pose_msg.pose.position.x:.4f}, {pose_msg.pose.position.y:.4f}, {pose_msg.pose.position.z:.4f}]'
+                        f'Published grasp - inference_time: {inference_time:.4f}s, processing_time: {grasp_data["processing_time"]:.4f}s, '
+                        f'gripper_width: {gripper_width:.4f}m'
                     )
                 except queue.Empty:
                     continue
@@ -294,9 +294,10 @@ class GraspNetRos2Node(Node):
             # Scale depth to meters for filtering
             depth_meters = depth / scale_factor
             # Filter out points that are too close (noise) or too far (not useful)
-            valid_depth = (depth_meters > 0.3) & (depth_meters < 3.0)  # Filter depth range: 30cm to 3m
+            # For top-down table view, use stricter depth range to remove distant points
+            valid_depth = (depth_meters > 0.3) & (depth_meters < 1.5)  # Filter depth range: 30cm to 1.5m for table
             workspace_mask = valid_depth
-            print(f'[*] Workspace mask: {np.sum(workspace_mask)} valid pixels (depth range: 0.3-3.0m)')
+            print(f'[*] Workspace mask: {np.sum(workspace_mask)} valid pixels (depth range: 0.3-1.5m for table view)')
             
             camera = GrCameraInfo(width, height, fx, fy, cx, cy, scale=scale_factor)
             
@@ -313,8 +314,72 @@ class GraspNetRos2Node(Node):
             print(f'[*] Masked cloud: {len(cloud_masked)} points')
             
             if len(cloud_masked) == 0:
-                print('[*] ERROR: No valid points in point cloud')
                 self.get_logger().warning('No valid points in point cloud')
+                return None
+            
+            # Additional filtering for top-down table view
+            if len(cloud_masked) > 0:
+                # Method 1: Filter by Z-coordinate (depth) - find table surface depth range
+                z_coords = cloud_masked[:, 2]  # Z is depth in camera frame
+                
+                # Use statistical filtering: keep points within reasonable range around median depth
+                # This helps identify the table surface and remove far background
+                z_median = np.median(z_coords)
+                z_std = np.std(z_coords)
+                
+                # Keep points within larger range around median (increased for Z direction)
+                # Allow Z direction to extend further
+                z_min = max(z_median - 0.5, 0.3)  # At least 30cm from camera
+                z_max = min(z_median + 0.5, 2.0)  # At most 2.0m, or 50cm above median
+                
+                # Method 2: Statistical outlier removal for XY plane
+                # Remove points that are outliers in XY plane (too far from main cluster)
+                x_coords = cloud_masked[:, 0]
+                y_coords = cloud_masked[:, 1]
+                
+                # Calculate median and std for X and Y coordinates
+                x_median = np.median(x_coords)
+                y_median = np.median(y_coords)
+                x_std = np.std(x_coords)
+                y_std = np.std(y_coords)
+                
+                # Use stricter statistical filtering: keep points within 2.0*std of median
+                # This removes outliers that are too far from the main cluster (like corners)
+                x_threshold = 2.0 * x_std
+                y_threshold = 2.0 * y_std
+                xy_outlier_mask = (np.abs(x_coords - x_median) <= x_threshold) & (np.abs(y_coords - y_median) <= y_threshold)
+                
+                # Also filter by absolute distance from camera center in XY plane
+                # Use stricter limit to remove corner regions
+                xy_distances = np.sqrt(x_coords**2 + y_coords**2)
+                max_xy_distance = 0.8  # Maximum 0.8m from camera center (stricter for table)
+                xy_distance_mask = xy_distances <= max_xy_distance
+                
+                # Additional filter: use IQR (Interquartile Range) method for robust outlier detection
+                x_q1, x_q3 = np.percentile(x_coords, [25, 75])
+                y_q1, y_q3 = np.percentile(y_coords, [25, 75])
+                x_iqr = x_q3 - x_q1
+                y_iqr = y_q3 - y_q1
+                # Keep points within 1.5*IQR of quartiles (standard outlier detection)
+                x_iqr_mask = (x_coords >= x_q1 - 1.5*x_iqr) & (x_coords <= x_q3 + 1.5*x_iqr)
+                y_iqr_mask = (y_coords >= y_q1 - 1.5*y_iqr) & (y_coords <= y_q3 + 1.5*y_iqr)
+                iqr_mask = x_iqr_mask & y_iqr_mask
+                
+                # Combined filter: Z depth range + XY statistical outlier removal + XY distance limit + IQR
+                table_mask = (z_coords >= z_min) & (z_coords <= z_max) & xy_outlier_mask & xy_distance_mask & iqr_mask
+                
+                cloud_masked = cloud_masked[table_mask]
+                color_masked = color_masked[table_mask]
+                
+                print(f'[*] After table filtering: {len(cloud_masked)} points (removed {np.sum(~table_mask)} distant/outlier points)')
+                print(f'[*] Table depth range: [{z_min:.3f}m, {z_max:.3f}m], median: {z_median:.3f}m, std: {z_std:.3f}m')
+                print(f'[*] XY statistical filter: X median±2σ=[{x_median-x_threshold:.3f}, {x_median+x_threshold:.3f}], Y median±2σ=[{y_median-y_threshold:.3f}, {y_median+y_threshold:.3f}]')
+                print(f'[*] XY IQR filter: X range=[{x_q1-1.5*x_iqr:.3f}, {x_q3+1.5*x_iqr:.3f}], Y range=[{y_q1-1.5*y_iqr:.3f}, {y_q3+1.5*y_iqr:.3f}]')
+                print(f'[*] XY distance limit: {max_xy_distance}m, removed {np.sum(~xy_outlier_mask)} std outliers, {np.sum(~iqr_mask)} IQR outliers')
+            
+            if len(cloud_masked) == 0:
+                print('[*] ERROR: No valid points in point cloud after table filtering')
+                self.get_logger().warning('No valid points in point cloud after table filtering')
                 return None
             
             # Sample points
@@ -370,35 +435,12 @@ class GraspNetRos2Node(Node):
                 print(f'[*] ERROR creating visualization point cloud: {e}')
                 raise
             
-            # Get grasps
-            print('[*] Running network inference...')
+            # Get grasps - measure neural network inference time
+            inference_start_time = time.time()
             with torch.no_grad():
                 end_points = self.net(end_points)
-                
-                # Debug: check objectness scores
-                objectness_score = end_points['objectness_score'][0]
-                # objectness_score shape is (2, num_seed) where 2 classes: [background, graspable]
-                objectness_pred = torch.argmax(objectness_score, 0)
-                
-                # Check raw scores too
-                positive_scores = objectness_score[1, :]  # scores for "graspable" class
-                max_positive_score = positive_scores.max().item()
-                mean_positive_score = positive_scores.mean().item()
-                num_positive = (objectness_pred == 1).sum().item()
-                print(f'[*] Objectness prediction: {num_positive} points classified as graspable out of {len(objectness_pred)}')
-                print(f'[*] Objectness positive scores: max={max_positive_score:.4f}, mean={mean_positive_score:.4f}')
-                
-                # Try with a threshold instead of argmax
-                threshold_positive = (positive_scores > 0.0).sum().item()
-                print(f'[*] Points with positive score > 0: {threshold_positive}')
-                
-                # Debug: check grasp scores
-                if 'grasp_score_pred' in end_points:
-                    grasp_scores = end_points['grasp_score_pred'][0]
-                    print(f'[*] Grasp score range: min={grasp_scores.min():.4f}, max={grasp_scores.max():.4f}, mean={grasp_scores.mean():.4f}')
-                
                 grasp_preds = pred_decode(end_points)
-            print('[*] Network inference complete')
+            inference_time = time.time() - inference_start_time
             
             gg_array = grasp_preds[0].detach().cpu().numpy()
             gg = GraspGroup(gg_array)
@@ -433,11 +475,11 @@ class GraspNetRos2Node(Node):
             
             # Calculate processing time
             processing_time = time.time() - start_time
-            print(f'[*] GraspNet processing time: {processing_time:.4f} seconds')
+            print(f'[!!!!!*] GraspNet processing time: {processing_time:.4f} seconds')
             
             # Series best grasp (highest score)
             if len(gg) == 0:
-                print('[*] No grasps found after filtering')
+                self.get_logger().warning('No grasps found after filtering')
                 return None
             
             best_grasp = gg[0]
@@ -446,11 +488,14 @@ class GraspNetRos2Node(Node):
             grasp_data = {
                 'grasp': best_grasp,
                 'processing_time': processing_time,
+                'inference_time': inference_time,
                 'timestamp': time.time()
             }
             
-            print('[*] Processing complete successfully!')
-            print(f'[*] Best grasp - score: {best_grasp.score:.4f}, width: {best_grasp.width:.4f}')
+            print(f'[!!!!!*] GraspNet inference time: {inference_time:.4f}s')
+
+            # Log neural network inference time
+            self.get_logger().info(f'Neural network inference time: {inference_time:.4f}s, Total processing time: {processing_time:.4f}s, Generated {len(gg)} grasps')
             return grasp_data
             
         except Exception as e:
@@ -463,33 +508,17 @@ class GraspNetRos2Node(Node):
     
     def visualize_grasps(self, gg, cloud):
         """Visualize predicted grasps."""
-        print(f'[*] Before NMS: {len(gg)} grasps')
-        gg.nms()
-        gg.sort_by_score()
-        gg = gg[:50]
-        
-        print(f'[*] Top grasps after NMS: {len(gg)}')
-        if len(gg) > 0:
-            print(f'[*] Best grasp score: {gg[0].score:.4f}')
-            print(f'[*] Best grasp translation: {gg[0].translation}')
-            print(f'[*] Best grasp rotation matrix shape: {gg[0].rotation_matrix.shape}')
-        
         grippers = gg.to_open3d_geometry_list()
         
         # Check for headless mode
         headless = cfgs.headless or os.environ.get('OPEN3D_HEADLESS', '').lower() in ('1', 'true', 'yes')
         
-        if headless:
-            print('[*] Running in headless mode - skipping visualization')
-            print(f'[*] Final: {len(gg)} grasps (top 50 after NMS)')
-        else:
-            print(f'[*] Visualizing {len(gg)} grasps (this may take a moment)')
+        if not headless:
             try:
-                o3d.visualization.draw_geometries([cloud, *grippers])
+                # o3d.visualization.draw_geometries([cloud, *grippers])
+                pass
             except Exception as e:
-                print(f'[*] Visualization error: {e}')
-                print('[*] Switching to headless mode')
-        print('[*] Visualization complete')
+                self.get_logger().warning(f'Visualization error: {e}')
 
 
 def get_net():
@@ -532,6 +561,9 @@ def main():
     
     except KeyboardInterrupt:
         print("\n[*] Shutting down...")
+    except rclpy.executors.ExternalShutdownException:
+        # This is a normal exception when ROS2 is shutting down externally
+        print("\n[*] ROS2 shutdown requested externally...")
     except Exception as e:
         print(f"\n[*] Error: {e}")
         import traceback
@@ -545,8 +577,18 @@ def main():
                 node.processing_thread.join(timeout=2.0)
             if node.publishing_thread is not None:
                 node.publishing_thread.join(timeout=2.0)
-            node.destroy_node()
-        rclpy.shutdown()
+            try:
+                node.destroy_node()
+            except Exception as e:
+                print(f"[*] Error destroying node: {e}")
+        
+        # Only shutdown if ROS2 context is still valid
+        try:
+            if rclpy.ok():
+                rclpy.shutdown()
+        except Exception as e:
+            # ROS2 may already be shut down, ignore the error
+            pass
 
 
 if __name__=='__main__':
