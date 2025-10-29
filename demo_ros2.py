@@ -11,9 +11,24 @@ import rclpy
 from rclpy.node import Node
 import cv_bridge
 from sensor_msgs.msg import Image, CameraInfo
+from geometry_msgs.msg import PoseStamped
+from std_msgs.msg import String, Float32, Header
+
+# Import custom message type (must be a ROS2 type). Fail fast if unavailable.
+try:
+    from graspnet_msgs.msg import GraspPose
+except Exception as import_err:
+    print("[!] Missing ROS2 message type 'graspnet_msgs/GraspPose'.")
+    print("    Please build and source the message package before running:")
+    print("    1) cd /root/src && colcon build")
+    print("    2) source /root/src/install/setup.bash")
+    raise import_err
 from cv_bridge import CvBridge
 import threading
 import time
+import json
+import queue
+from scipy.spatial.transform import Rotation as R
 
 import torch
 from graspnetAPI import GraspGroup
@@ -39,7 +54,8 @@ parser.add_argument('--headless', action='store_true', help='Run in headless mod
 parser.add_argument('--color_topic', type=str, default='/camera/color/image_raw', help='Color image topic')
 parser.add_argument('--depth_topic', type=str, default='/camera/depth/image_raw', help='Depth image topic')
 parser.add_argument('--camera_info_topic', type=str, default='/camera/color/camera_info', help='Camera info topic')
-parser.add_argument('--process_once', action='store_true', help='Process only one frame then exit')
+parser.add_argument('--grasp_topic', type=str, default='/graspnet/grasps', help='Topic to publish grasp results')
+parser.add_argument('--processing_interval', type=float, default=2.0, help='Interval between processing frames in seconds [default: 2.0]')
 cfgs = parser.parse_args()
 
 
@@ -56,9 +72,15 @@ class GraspNetRos2Node(Node):
         self.color_image = None
         self.depth_image = None
         self.camera_info = None
-        self.lock = threading.Lock()
-        self.processed = False
-        self.processing = False
+        self.data_lock = threading.Lock()
+        
+        # Queue for passing grasp results from processing thread to publishing thread
+        self.grasp_result_queue = queue.Queue(maxsize=5)
+        
+        # Thread control
+        self.running = True
+        self.processing_thread = None
+        self.publishing_thread = None
         
         # Create subscribers
         self.sub_color = self.create_subscription(
@@ -79,17 +101,23 @@ class GraspNetRos2Node(Node):
             self.camera_info_callback,
             10)
         
-        # Create timer for continuous processing
-        if not cfgs.process_once:
-            self.timer = self.create_timer(2.0, self.timer_callback)
+        # Create publisher for grasp results
+        # Using custom GraspPose message type
+        self.grasp_pub = self.create_publisher(
+            GraspPose,
+            cfgs.grasp_topic,
+            10)
+        
+        # Start processing and publishing threads
+        self.processing_thread = threading.Thread(target=self.processing_loop, daemon=True)
+        self.publishing_thread = threading.Thread(target=self.publishing_loop, daemon=True)
+        self.processing_thread.start()
+        self.publishing_thread.start()
         
         self.get_logger().info('[*] GraspNet ROS2 node started')
         self.get_logger().info(f'[*] Subscribing to: {cfgs.color_topic}, {cfgs.depth_topic}, {cfgs.camera_info_topic}')
-    
-    def timer_callback(self):
-        """Timer callback for continuous processing."""
-        if not self.processing:
-            self.process_frame()
+        self.get_logger().info(f'[*] Publishing grasps to: {cfgs.grasp_topic}')
+        self.get_logger().info(f'[*] Processing interval: {cfgs.processing_interval}s')
     
     def color_callback(self, msg):
         """Callback for color image."""
@@ -97,73 +125,130 @@ class GraspNetRos2Node(Node):
             cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
             # Convert BGR to RGB
             cv_image = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
-            with self.lock:
+            with self.data_lock:
                 self.color_image = cv_image
-                self.get_logger().info(f'Received color image: {cv_image.shape}')
         except Exception as e:
             self.get_logger().error(f'Error converting color image: {e}')
-        
-        # If process_once mode, try to process frame when all data is ready
-        if cfgs.process_once and not self.processed and not self.processing:
-            with self.lock:
-                if self.color_image is not None and self.depth_image is not None and self.camera_info is not None:
-                    # Trigger processing in background to avoid blocking callbacks
-                    thread = threading.Thread(target=self.process_frame)
-                    thread.daemon = True
-                    thread.start()
     
     def depth_callback(self, msg):
         """Callback for depth image."""
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
-            with self.lock:
+            with self.data_lock:
                 self.depth_image = cv_image
-                self.get_logger().info(f'Received depth image: {cv_image.shape}')
         except Exception as e:
             self.get_logger().error(f'Error converting depth image: {e}')
-        
-        # If process_once mode, try to process frame when all data is ready
-        if cfgs.process_once and not self.processed and not self.processing:
-            with self.lock:
-                if self.color_image is not None and self.depth_image is not None and self.camera_info is not None:
-                    # Trigger processing in background to avoid blocking callbacks
-                    thread = threading.Thread(target=self.process_frame)
-                    thread.daemon = True
-                    thread.start()
     
     def camera_info_callback(self, msg):
         """Callback for camera info."""
-        with self.lock:
+        with self.data_lock:
             self.camera_info = msg
-            self.get_logger().info(f'Received camera info: {msg.width}x{msg.height}')
-        
-        # If process_once mode, try to process frame when all data is ready
-        if cfgs.process_once and not self.processed and not self.processing:
-            with self.lock:
-                if self.color_image is not None and self.depth_image is not None and self.camera_info is not None:
-                    # Trigger processing in background to avoid blocking callbacks
-                    thread = threading.Thread(target=self.process_frame)
-                    thread.daemon = True
-                    thread.start()
     
-    def process_frame(self):
-        """Process one frame if all data is ready."""
-        with self.lock:
-            if self.color_image is None or self.depth_image is None or self.camera_info is None:
-                return False
-            
-            if self.processed and cfgs.process_once:
-                return True
-            
-            if self.processing:
-                return False  # Already processing
-            
-            # Make copies
-            color_img = self.color_image.copy()
-            depth_img = self.depth_image.copy()
-            cam_info = self.camera_info
-            # Don't set self.processed = True here! Wait until processing is complete
-            self.processing = True
+    def processing_loop(self):
+        """Processing thread: continuously collect data and compute grasps."""
+        while self.running:
+            try:
+                # Get latest data snapshot
+                with self.data_lock:
+                    if self.color_image is None or self.depth_image is None or self.camera_info is None:
+                        time.sleep(0.1)
+                        continue
+                    
+                    # Make copies
+                    color_img = self.color_image.copy()
+                    depth_img = self.depth_image.copy()
+                    cam_info = self.camera_info
+                
+                # Process the frame
+                grasp_result = self.process_frame(color_img, depth_img, cam_info)
+                
+                # Put result in queue for publishing thread (non-blocking, drop if queue full)
+                if grasp_result is not None:
+                    try:
+                        self.grasp_result_queue.put_nowait(grasp_result)
+                    except queue.Full:
+                        self.get_logger().warn('Grasp result queue full, dropping oldest result')
+                        try:
+                            self.grasp_result_queue.get_nowait()  # Remove oldest
+                            self.grasp_result_queue.put_nowait(grasp_result)  # Add new
+                        except queue.Empty:
+                            pass
+                
+                # Wait for next processing cycle
+                time.sleep(cfgs.processing_interval)
+                
+            except Exception as e:
+                self.get_logger().error(f'Error in processing loop: {e}')
+                import traceback
+                self.get_logger().error(traceback.format_exc())
+                time.sleep(1.0)
+    
+    def grasp_to_pose_stamped(self, grasp):
+        """Convert a Grasp object to PoseStamped message."""
+        msg = PoseStamped()
+        
+        # Set header
+        msg.header = Header()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "camera_color_optical_frame"
+        
+        # Set position (translation)
+        trans = grasp.translation.astype(float)
+        msg.pose.position.x = float(trans[0])
+        msg.pose.position.y = float(trans[1])
+        msg.pose.position.z = float(trans[2])
+        
+        # Set orientation (rotation matrix to quaternion)
+        rotation_matrix = grasp.rotation_matrix.reshape(3, 3)
+        quat = R.from_matrix(rotation_matrix).as_quat()
+        msg.pose.orientation.x = float(quat[0])
+        msg.pose.orientation.y = float(quat[1])
+        msg.pose.orientation.z = float(quat[2])
+        msg.pose.orientation.w = float(quat[3])
+        
+        return msg
+    
+    def publishing_loop(self):
+        """Publishing thread: continuously publish grasp results from queue."""
+        while self.running:
+            try:
+                # Get grasp result from queue (blocking with timeout)
+                try:
+                    grasp_data = self.grasp_result_queue.get(timeout=0.5)
+                    
+                    # Convert grasp to GraspPose message (ROS2 message type)
+                    best_grasp = grasp_data['grasp']
+                    pose_msg = self.grasp_to_pose_stamped(best_grasp)
+                    gripper_width = float(best_grasp.width)
+                    
+                    # Create GraspPose message
+                    # Message structure: geometry_msgs/PoseStamped target_pose, float32 gripper_width
+                    grasp_pose_msg = GraspPose()
+                    grasp_pose_msg.target_pose = pose_msg
+                    grasp_pose_msg.gripper_width = gripper_width
+                    
+                    # Publish GraspPose message
+                    self.grasp_pub.publish(grasp_pose_msg)
+                    
+                    self.get_logger().info(
+                        f'Published grasp - processing_time: {grasp_data["processing_time"]:.4f}s, '
+                        f'gripper_width: {gripper_width:.4f}m, '
+                        f'pose: [{pose_msg.pose.position.x:.4f}, {pose_msg.pose.position.y:.4f}, {pose_msg.pose.position.z:.4f}]'
+                    )
+                except queue.Empty:
+                    continue
+                    
+            except Exception as e:
+                self.get_logger().error(f'Error in publishing loop: {e}')
+                import traceback
+                self.get_logger().error(traceback.format_exc())
+                time.sleep(0.1)
+    
+    def process_frame(self, color_img, depth_img, cam_info):
+        """Process one frame and return grasp results."""
+        
+        # Record start time for performance measurement
+        start_time = time.time()
         
         # Process the frame
         try:
@@ -230,10 +315,7 @@ class GraspNetRos2Node(Node):
             if len(cloud_masked) == 0:
                 print('[*] ERROR: No valid points in point cloud')
                 self.get_logger().warning('No valid points in point cloud')
-                with self.lock:
-                    self.processing = False
-                    self.processed = True  # Mark as processed even if failed
-                return False
+                return None
             
             # Sample points
             print(f'[*] Sampling {cfgs.num_point} points from {len(cloud_masked)}...')
@@ -277,8 +359,6 @@ class GraspNetRos2Node(Node):
                 print('[*] Visualization point cloud created')
                 
                 # Save input point cloud to PLY file
-                import os
-                import time
                 # Create output directory (relative to current working directory)
                 output_dir = '../output'
                 os.makedirs(output_dir, exist_ok=True)
@@ -341,15 +421,37 @@ class GraspNetRos2Node(Node):
                 print(f'[*] {len(gg_filtered)} grasps after collision detection (original: {len(gg)})')
                 gg = gg_filtered
             
-            # Visualize
-            print(f'[*] Starting visualization...')
-            self.visualize_grasps(gg, vis_cloud)
+            # Visualize (optional, can be done in headless_viz mode)
+            if not cfgs.headless:
+                print(f'[*] Starting visualization...')
+                self.visualize_grasps(gg, vis_cloud)
+            
+            # Prepare grasp results for publishing
+            gg.nms()
+            gg.sort_by_score()
+            gg = gg[:50]  # Keep top 50
+            
+            # Calculate processing time
+            processing_time = time.time() - start_time
+            print(f'[*] GraspNet processing time: {processing_time:.4f} seconds')
+            
+            # Series best grasp (highest score)
+            if len(gg) == 0:
+                print('[*] No grasps found after filtering')
+                return None
+            
+            best_grasp = gg[0]
+            
+            # Prepare data structure for publishing thread
+            grasp_data = {
+                'grasp': best_grasp,
+                'processing_time': processing_time,
+                'timestamp': time.time()
+            }
             
             print('[*] Processing complete successfully!')
-            with self.lock:
-                self.processing = False
-                self.processed = True  # Mark as processed after successful completion
-            return True
+            print(f'[*] Best grasp - score: {best_grasp.score:.4f}, width: {best_grasp.width:.4f}')
+            return grasp_data
             
         except Exception as e:
             print(f'\n[*] ERROR processing frame: {e}')
@@ -357,10 +459,7 @@ class GraspNetRos2Node(Node):
             print(traceback.format_exc())
             self.get_logger().error(f'Error processing frame: {e}')
             self.get_logger().error(traceback.format_exc())
-            with self.lock:
-                self.processing = False
-                self.processed = True  # Mark as processed even on error
-            return False
+            return None
     
     def visualize_grasps(self, gg, cloud):
         """Visualize predicted grasps."""
@@ -423,42 +522,13 @@ def main():
         # Create ROS2 node
         node = GraspNetRos2Node(net)
         
-        if cfgs.process_once:
-            # Process one frame
-            print("[*] Waiting for camera data...")
-            import time
-            start_time = time.time()
-            timeout = 30.0  # 30 seconds timeout
-            
-            while not node.processed:
-                rclpy.spin_once(node, timeout_sec=0.1)
-                
-                # Check timeout
-                elapsed = time.time() - start_time
-                if elapsed > timeout:
-                    print(f"\n[*] Timeout after {timeout}s waiting for camera data")
-                    print("[*] Please check if camera topics are publishing:")
-                    print("    - /camera/color/image_raw")
-                    print("    - /camera/depth/image_raw")
-                    print("    - /camera/color/camera_info")
-                    break
-                
-                # Print status every 2 seconds
-                if int(elapsed) % 2 == 0 and int(elapsed) > 0:
-                    if node.color_image is None:
-                        print(f"[*] Waiting for color image... ({int(elapsed)}s)")
-                    elif node.depth_image is None:
-                        print(f"[*] Waiting for depth image... ({int(elapsed)}s)")
-                    elif node.camera_info is None:
-                        print(f"[*] Waiting for camera info... ({int(elapsed)}s)")
-            
-            if node.processed:
-                print("[*] Frame processed, exiting...")
-        else:
-            # Continuous processing
-            print("[*] Starting continuous processing (press Ctrl+C to stop)...")
-            print("[*] Processing frame every 2 seconds")
-            rclpy.spin(node)
+        # Continuous processing with multithreading
+        print("[*] Starting continuous processing (press Ctrl+C to stop)...")
+        print(f"[*] Processing frame every {cfgs.processing_interval} seconds")
+        print("[*] Grasp results will be published to:", cfgs.grasp_topic)
+        
+        # Spin ROS2 node (handles callbacks)
+        rclpy.spin(node)
     
     except KeyboardInterrupt:
         print("\n[*] Shutting down...")
@@ -468,6 +538,13 @@ def main():
         traceback.print_exc()
     finally:
         if node is not None:
+            # Signal threads to stop
+            node.running = False
+            # Wait for threads to finish
+            if node.processing_thread is not None:
+                node.processing_thread.join(timeout=2.0)
+            if node.publishing_thread is not None:
+                node.publishing_thread.join(timeout=2.0)
             node.destroy_node()
         rclpy.shutdown()
 
